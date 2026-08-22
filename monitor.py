@@ -2,7 +2,7 @@ import json
 import os
 import sys
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import requests
@@ -17,6 +17,9 @@ MOVIE_NAME = "奥德赛"
 API_URL = "https://m.maoyan.com/ajax/cinemaDetail"
 
 STATE_FILE = Path("state.json")
+
+# 监控未来多少天
+MONITOR_DAYS = 10
 
 HEADERS = {
     "User-Agent": (
@@ -33,7 +36,9 @@ def load_state():
         return {"showtimes": []}
 
     try:
-        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        return json.loads(
+            STATE_FILE.read_text(encoding="utf-8")
+        )
     except Exception:
         return {"showtimes": []}
 
@@ -51,6 +56,10 @@ def save_state(showtimes):
 
 
 def fetch_showtimes(date):
+    """
+    查询指定日期的猫眼排片。
+    """
+
     params = {
         "movieId": MOVIE_ID,
         "cinemaId": CINEMA_ID,
@@ -68,6 +77,7 @@ def fetch_showtimes(date):
     )
 
     response.raise_for_status()
+
     data = response.json()
 
     results = []
@@ -109,23 +119,45 @@ def fetch_showtimes(date):
     return results
 
 
-def fetch_all():
-    today = datetime.now().strftime("%Y-%m-%d")
+def fetch_future_showtimes():
+    """
+    查询今天开始、未来 MONITOR_DAYS 天内的排片。
 
-    print(f"Checking Maoyan for date: {today}")
+    每一天单独请求一次，避免依赖猫眼 API
+    是否一次返回完整的未来排片。
+    """
 
-    results = fetch_showtimes(today)
+    today = datetime.now().date()
 
-    print(f"Maoyan returned {len(results)} showtimes.")
+    all_showtimes = []
 
-    if results:
-        for show in results:
+    print("========================================")
+    print(
+        f"Checking next {MONITOR_DAYS} days "
+        f"from {today}"
+    )
+    print("========================================")
+
+    for i in range(MONITOR_DAYS):
+        date = today + timedelta(days=i)
+        date_str = date.strftime("%Y-%m-%d")
+
+        try:
+            results = fetch_showtimes(date_str)
+
             print(
-                f"  {show['date']} {show['time']} "
-                f"{show['hall']} {show['language']}"
+                f"{date_str}: "
+                f"{len(results)} showtimes"
             )
 
-    return results
+            all_showtimes.extend(results)
+
+        except Exception as e:
+            print(
+                f"{date_str}: ERROR while fetching: {e}"
+            )
+
+    return all_showtimes
 
 
 def get_bark_key():
@@ -156,13 +188,14 @@ def send_bark(new_showtimes):
         key=lambda x: (x["date"], x["time"]),
     ):
         lines.append(
-            f"{show['date']}  {show['time']}  "
-            f"{show['language']}  {show['hall']}"
+            f"{show['date']}  "
+            f"{show['time']}  "
+            f"{show['language']}  "
+            f"{show['hall']}"
         )
 
     body = "\n".join(lines)
 
-    # Bark：不要在 Key 后面加 /
     url = f"https://api.day.app/{bark_key}"
 
     response = requests.get(
@@ -198,7 +231,6 @@ def send_bark_test():
         "如果你看到这条通知，说明推送链路正常。"
     )
 
-    # Bark：不要在 Key 后面加 /
     url = f"https://api.day.app/{bark_key}"
 
     response = requests.get(
@@ -222,7 +254,11 @@ def send_bark_test():
 
 
 def main():
-    test_bark = os.environ.get("TEST_BARK", "").lower() == "true"
+    # GitHub Actions 手动测试 Bark
+    test_bark = (
+        os.environ.get("TEST_BARK", "").lower()
+        == "true"
+    )
 
     if test_bark:
         print("========================================")
@@ -237,41 +273,74 @@ def main():
         print("Bark test completed.")
         return
 
+    # 正常监控模式
     old_state = load_state()
-    old_keys = set(old_state.get("showtimes", []))
+    old_keys = set(
+        old_state.get("showtimes", [])
+    )
 
     print("========================================")
     print("NORMAL MONITOR MODE")
     print("========================================")
 
-    print(f"Previously known showtimes: {len(old_keys)}")
+    print(
+        f"Previously known showtimes: "
+        f"{len(old_keys)}"
+    )
 
-    current = fetch_all()
-    current_keys = {x["key"] for x in current}
+    current = fetch_future_showtimes()
 
-    print(f"Current showtimes: {len(current_keys)}")
+    current_keys = {
+        x["key"]
+        for x in current
+    }
 
+    print("----------------------------------------")
+    print(
+        f"Total showtimes in next "
+        f"{MONITOR_DAYS} days: "
+        f"{len(current_keys)}"
+    )
+
+    # 第一次运行
     if not old_state.get("showtimes"):
         save_state(current_keys)
-        print("Initial baseline created. No notification sent.")
+
+        print(
+            "Initial baseline created. "
+            "No notification sent."
+        )
+
         return
 
+    # 找新增场次
     new_keys = current_keys - old_keys
 
     if new_keys:
         new_showtimes = [
-            x for x in current
+            x
+            for x in current
             if x["key"] in new_keys
         ]
 
-        print(f"NEW SHOWTIMES FOUND: {len(new_showtimes)}")
+        print(
+            f"NEW SHOWTIMES FOUND: "
+            f"{len(new_showtimes)}"
+        )
 
-        for show in new_showtimes:
+        for show in sorted(
+            new_showtimes,
+            key=lambda x: (
+                x["date"],
+                x["time"],
+            ),
+        ):
             print(
-                show["date"],
-                show["time"],
-                show["hall"],
-                show["language"],
+                f"NEW: "
+                f"{show['date']} "
+                f"{show['time']} "
+                f"{show['hall']} "
+                f"{show['language']}"
             )
 
         send_bark(new_showtimes)
@@ -279,7 +348,9 @@ def main():
     else:
         print("No new showtimes.")
 
+    # 保存最新状态
     save_state(current_keys)
+
     print("State saved successfully.")
 
 
