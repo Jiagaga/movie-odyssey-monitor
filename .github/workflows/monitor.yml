@@ -1,0 +1,48 @@
+name: Monitor The Odyssey
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install requests
+
+      - name: Check Maoyan
+        env:
+          BARK_KEY: ${{ secrets.BARK_KEY }}
+        run: |
+          python monitor.py
+
+      - name: Save state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add state.json
+
+          if git diff --cached --quiet; then
+            echo "No state changes."
+          else
+            git commit -m "Update movie showtime state"
+            git push
+          fi
