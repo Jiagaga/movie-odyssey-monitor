@@ -2,10 +2,11 @@ import json
 import os
 import sys
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 import requests
+
 
 CINEMA_ID = 37534
 MOVIE_ID = 1545360
@@ -26,6 +27,7 @@ HEADERS = {
     "Accept": "application/json, text/plain, */*",
 }
 
+
 def load_state():
     if not STATE_FILE.exists():
         return {"showtimes": []}
@@ -34,6 +36,7 @@ def load_state():
         return json.loads(STATE_FILE.read_text(encoding="utf-8"))
     except Exception:
         return {"showtimes": []}
+
 
 def save_state(showtimes):
     data = {
@@ -45,6 +48,7 @@ def save_state(showtimes):
         json.dumps(data, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+
 
 def fetch_showtimes(date):
     params = {
@@ -104,21 +108,40 @@ def fetch_showtimes(date):
 
     return results
 
-def fetch_all():
-    """
-    猫眼通常会在 cinemaDetail 返回未来若干天的排片。
-    为了避免频繁请求，只请求今天一次。
-    """
 
+def fetch_all():
     today = datetime.now().strftime("%Y-%m-%d")
 
-    return fetch_showtimes(today)
+    print(f"Checking Maoyan for date: {today}")
 
-def send_bark(new_showtimes):
+    results = fetch_showtimes(today)
+
+    print(f"Maoyan returned {len(results)} showtimes.")
+
+    if results:
+        for show in results:
+            print(
+                f"  {show['date']} {show['time']} "
+                f"{show['hall']} {show['language']}"
+            )
+
+    return results
+
+
+def get_bark_key():
     bark_key = os.environ.get("BARK_KEY")
 
     if not bark_key:
-        print("BARK_KEY is not configured.")
+        print("ERROR: BARK_KEY is not configured.")
+        return None
+
+    return bark_key
+
+
+def send_bark(new_showtimes):
+    bark_key = get_bark_key()
+
+    if not bark_key:
         return False
 
     title = f"🎬《{MOVIE_NAME}》新增场次"
@@ -128,7 +151,10 @@ def send_bark(new_showtimes):
         "",
     ]
 
-    for show in sorted(new_showtimes, key=lambda x: (x["date"], x["time"])):
+    for show in sorted(
+        new_showtimes,
+        key=lambda x: (x["date"], x["time"]),
+    ):
         lines.append(
             f"{show['date']}  {show['time']}  "
             f"{show['language']}  {show['hall']}"
@@ -152,20 +178,78 @@ def send_bark(new_showtimes):
 
     response.raise_for_status()
 
-    print("Bark notification sent.")
+    print("Bark notification sent successfully.")
+    print(f"Bark response: {response.text}")
+
     return True
 
+
+def send_bark_test():
+    bark_key = get_bark_key()
+
+    if not bark_key:
+        return False
+
+    title = "🧪《奥德赛》监控测试"
+
+    body = (
+        "GitHub Actions → Bark → iPhone\n"
+        "如果你看到这条通知，说明推送链路正常。"
+    )
+
+    url = f"https://api.day.app/{bark_key}/"
+
+    response = requests.get(
+        url,
+        params={
+            "title": title,
+            "body": body,
+            "group": "奥德赛监控",
+            "level": "active",
+            "sound": "alarm",
+        },
+        timeout=15,
+    )
+
+    response.raise_for_status()
+
+    print("Bark TEST notification sent successfully.")
+    print(f"Bark response: {response.text}")
+
+    return True
+
+
 def main():
+    # GitHub Actions 手动测试 Bark 时使用
+    test_bark = os.environ.get("TEST_BARK", "").lower() == "true"
+
+    if test_bark:
+        print("========================================")
+        print("BARK TEST MODE")
+        print("========================================")
+
+        success = send_bark_test()
+
+        if not success:
+            raise RuntimeError("Bark test failed.")
+
+        print("Bark test completed.")
+        return
+
+    # 正常监控模式
     old_state = load_state()
     old_keys = set(old_state.get("showtimes", []))
 
-    print("Checking Maoyan...")
+    print("========================================")
+    print("NORMAL MONITOR MODE")
+    print("========================================")
+
+    print(f"Previously known showtimes: {len(old_keys)}")
 
     current = fetch_all()
     current_keys = {x["key"] for x in current}
 
-    print(f"Current showtimes: {len(current)}")
-    print(f"Previously known: {len(old_keys)}")
+    print(f"Current showtimes: {len(current_keys)}")
 
     # 第一次运行：建立基准，不发送通知
     if not old_state.get("showtimes"):
@@ -192,10 +276,13 @@ def main():
             )
 
         send_bark(new_showtimes)
+
     else:
         print("No new showtimes.")
 
     save_state(current_keys)
+    print("State saved successfully.")
+
 
 if __name__ == "__main__":
     try:
