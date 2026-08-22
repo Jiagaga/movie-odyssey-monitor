@@ -162,7 +162,8 @@ def send_bark(new_showtimes):
 
     body = "\n".join(lines)
 
-    url = f"https://api.day.app/{bark_key}/"
+    # Bark：不要在 Key 后面加 /
+    url = f"https://api.day.app/{bark_key}"
 
     response = requests.get(
         url,
@@ -197,7 +198,8 @@ def send_bark_test():
         "如果你看到这条通知，说明推送链路正常。"
     )
 
-    url = f"https://api.day.app/{bark_key}/"
+    # Bark：不要在 Key 后面加 /
+    url = f"https://api.day.app/{bark_key}"
 
     response = requests.get(
         url,
@@ -220,7 +222,6 @@ def send_bark_test():
 
 
 def main():
-    # GitHub Actions 手动测试 Bark 时使用
     test_bark = os.environ.get("TEST_BARK", "").lower() == "true"
 
     if test_bark:
@@ -236,7 +237,6 @@ def main():
         print("Bark test completed.")
         return
 
-    # 正常监控模式
     old_state = load_state()
     old_keys = set(old_state.get("showtimes", []))
 
@@ -251,7 +251,6 @@ def main():
 
     print(f"Current showtimes: {len(current_keys)}")
 
-    # 第一次运行：建立基准，不发送通知
     if not old_state.get("showtimes"):
         save_state(current_keys)
         print("Initial baseline created. No notification sent.")
