@@ -6,7 +6,6 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import requests
-from bs4 import BeautifulSoup
 
 
 CINEMA_ID = 37534
@@ -15,11 +14,12 @@ MOVIE_ID = 1545360
 CINEMA_NAME = "MOViE MOViE 前滩太古里"
 MOVIE_NAME = "奥德赛"
 
-CINEMA_URL = f"https://www.maoyan.com/cinema/{CINEMA_ID}"
-
 STATE_FILE = Path("state.json")
 
 MONITOR_DAYS = 10
+
+# 猫眼 H5 API
+MAOYAN_API_URL = "https://m.maoyan.com/ajax/cinemaDetail"
 
 HEADERS = {
     "User-Agent": (
@@ -28,11 +28,12 @@ HEADERS = {
         "Version/18.0 Mobile/15E148 Safari/604.1"
     ),
     "Accept": (
-        "text/html,application/xhtml+xml,"
-        "application/xml;q=0.9,*/*;q=0.8"
+        "application/json, text/plain, */*"
     ),
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-    "Referer": "https://www.maoyan.com/",
+    "Referer": "https://m.maoyan.com/",
+    "X-Requested-With": "XMLHttpRequest",
+    "Connection": "keep-alive",
 }
 
 
@@ -42,7 +43,9 @@ def load_state():
 
     try:
         return json.loads(
-            STATE_FILE.read_text(encoding="utf-8")
+            STATE_FILE.read_text(
+                encoding="utf-8"
+            )
         )
     except Exception:
         return {"showtimes": []}
@@ -55,325 +58,527 @@ def save_state(showtimes):
     }
 
     STATE_FILE.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2),
+        json.dumps(
+            data,
+            ensure_ascii=False,
+            indent=2,
+        ),
         encoding="utf-8",
     )
 
 
-def fetch_page():
-    print(f"Fetching Maoyan cinema page:")
-    print(CINEMA_URL)
+def request_maoyan(params):
+    """
+    请求猫眼 H5 cinemaDetail API。
+
+    第一阶段故意保持请求简单：
+    cinemaId + movieId + date。
+
+    如果猫眼接口对参数有不同要求，
+    会把 HTTP 状态和响应内容打印出来，
+    方便继续调整。
+    """
+
+    print("----------------------------------------")
+    print("Calling Maoyan H5 API:")
+    print(MAOYAN_API_URL)
+    print(f"Params: {params}")
 
     response = requests.get(
-        CINEMA_URL,
+        MAOYAN_API_URL,
+        params=params,
         headers=HEADERS,
         timeout=30,
     )
 
-    response.raise_for_status()
-
-    if len(response.text) < 10000:
-        raise RuntimeError(
-            f"Maoyan page is suspiciously short: "
-            f"{len(response.text)} bytes"
-        )
+    print(
+        f"HTTP status: {response.status_code}"
+    )
 
     print(
-        f"Maoyan page downloaded: "
+        f"Response length: "
         f"{len(response.text)} bytes"
     )
 
-    if MOVIE_NAME not in response.text:
-        raise RuntimeError(
-            f"Movie '{MOVIE_NAME}' was not found "
-            f"in Maoyan page HTML."
-        )
+    response.raise_for_status()
 
-    print(f"Found movie '{MOVIE_NAME}' in page HTML.")
-
-    return response.text
-
-
-def extract_movie_section(html):
-    """
-    尝试定位《奥德赛》所在的影院页面区域。
-
-    猫眼页面结构可能变化，因此这里采用多层
-    fallback，而不是依赖一个非常脆弱的 CSS class。
-    """
-
-    soup = BeautifulSoup(html, "html.parser")
-
-    # 第一优先：找到包含“奥德赛”的标题节点
-    candidates = []
-
-    for tag in soup.find_all(
-        ["h1", "h2", "h3", "h4", "div", "span", "a"]
-    ):
-        text = tag.get_text(" ", strip=True)
-
-        if text == MOVIE_NAME:
-            candidates.append(tag)
-
-    if not candidates:
-        raise RuntimeError(
-            f"Could not locate exact movie heading "
-            f"'{MOVIE_NAME}'."
-        )
-
-    movie_node = candidates[0]
-
-    print(
-        f"Located movie node: "
-        f"<{movie_node.name}>"
+    content_type = response.headers.get(
+        "Content-Type",
+        "",
     )
 
-    # 向上寻找包含排片表的较大容器
-    parent = movie_node
+    print(
+        f"Content-Type: {content_type}"
+    )
 
-    for _ in range(8):
-        if parent.parent is None:
-            break
+    # 打印前 1000 个字符。
+    # 第一次跑 API 时尤其重要。
+    print("Response preview:")
+    print(response.text[:1000])
 
-        parent = parent.parent
+    try:
+        data = response.json()
+    except Exception as e:
+        raise RuntimeError(
+            "Maoyan API did not return valid JSON. "
+            f"Response starts with: "
+            f"{response.text[:500]}"
+        ) from e
 
-        text = parent.get_text(
-            " ",
-            strip=True,
+    if not isinstance(data, dict):
+        raise RuntimeError(
+            "Maoyan API JSON root is not an object."
         )
 
-        # 一个合理的电影排片区域通常会包含：
-        # 放映时间 / 语言版本 / 放映厅
-        if (
-            "放映时间" in text
-            and "语言版本" in text
-            and "放映厅" in text
-        ):
-            print(
-                "Found movie schedule container."
+    return data
+
+
+def recursive_find_movie_objects(obj):
+    """
+    在未知 JSON 结构中寻找可能代表电影的 dict。
+
+    不依赖固定的 JSON 路径。
+    """
+
+    found = []
+
+    if isinstance(obj, dict):
+        keys_lower = {
+            str(k).lower()
+            for k in obj.keys()
+        }
+
+        # 常见电影对象特征
+        movie_like = (
+            "movieid" in keys_lower
+            or "movie_id" in keys_lower
+            or "showtimes" in keys_lower
+            or "shows" in keys_lower
+        )
+
+        if movie_like:
+            found.append(obj)
+
+        for value in obj.values():
+            found.extend(
+                recursive_find_movie_objects(value)
             )
-            return parent
 
-    # fallback：返回 movie node 的父级
-    return movie_node.parent
+    elif isinstance(obj, list):
+        for item in obj:
+            found.extend(
+                recursive_find_movie_objects(item)
+            )
+
+    return found
 
 
-def parse_date_from_text(text, reference_year):
+def object_movie_id(obj):
+    for key in (
+        "movieId",
+        "movie_id",
+        "movieID",
+        "id",
+    ):
+        if key in obj:
+            value = obj[key]
+
+            try:
+                return int(value)
+            except Exception:
+                pass
+
+    return None
+
+
+def object_movie_name(obj):
+    for key in (
+        "movieName",
+        "movie_name",
+        "movieTitle",
+        "movie_title",
+        "name",
+        "title",
+    ):
+        if key in obj:
+            value = obj[key]
+
+            if isinstance(value, str):
+                return value.strip()
+
+    return ""
+
+
+def find_target_movie_objects(data):
     """
-    从文本中寻找：
-    8月29
-    8月30日
-    今天
-    等日期。
+    找到《奥德赛》对应的电影对象。
 
-    返回 YYYY-MM-DD。
+    优先使用 MOVIE_ID。
+    如果 JSON 没有 movieId，再尝试电影名称。
     """
 
-    # 今天
-    if "今天" in text:
-        return datetime.now().date()
+    objects = recursive_find_movie_objects(
+        data
+    )
 
+    print(
+        f"Potential movie objects found: "
+        f"{len(objects)}"
+    )
+
+    by_id = []
+
+    for obj in objects:
+        mid = object_movie_id(obj)
+
+        if mid == MOVIE_ID:
+            by_id.append(obj)
+
+    if by_id:
+        print(
+            f"Found target movie by MOVIE_ID: "
+            f"{MOVIE_ID}"
+        )
+
+        return by_id
+
+    by_name = []
+
+    for obj in objects:
+        name = object_movie_name(obj)
+
+        if MOVIE_NAME in name:
+            by_name.append(obj)
+
+    if by_name:
+        print(
+            f"Found target movie by name: "
+            f"{MOVIE_NAME}"
+        )
+
+        return by_name
+
+    return []
+
+
+def recursive_find_showtime_objects(obj):
+    """
+    从电影对象中递归寻找可能的场次对象。
+    """
+
+    found = []
+
+    if isinstance(obj, dict):
+
+        # 常见场次字段
+        has_time = any(
+            key in obj
+            for key in (
+                "showTime",
+                "showtime",
+                "show_time",
+                "startTime",
+                "start_time",
+                "beginTime",
+                "begin_time",
+            )
+        )
+
+        if has_time:
+            found.append(obj)
+
+        for value in obj.values():
+            found.extend(
+                recursive_find_showtime_objects(
+                    value
+                )
+            )
+
+    elif isinstance(obj, list):
+
+        for item in obj:
+            found.extend(
+                recursive_find_showtime_objects(
+                    item
+                )
+            )
+
+    return found
+
+
+def get_value(obj, keys):
+    for key in keys:
+        if key in obj:
+            return obj[key]
+
+    return None
+
+
+def normalize_time(value):
+    """
+    把各种可能的时间格式统一成 HH:MM。
+    """
+
+    if value is None:
+        return None
+
+    text = str(value).strip()
+
+    # 例如：
+    # 10:30
+    # 10:30:00
+    # 2026-08-22 10:30:00
+    # 2026-08-22T10:30:00
     match = re.search(
-        r"(\d{1,2})月(\d{1,2})日?",
+        r"\b([01]\d|2[0-3]):([0-5]\d)"
+        r"(?::[0-5]\d)?\b",
         text,
     )
 
-    if not match:
-        return None
+    if match:
+        return (
+            f"{match.group(1)}:"
+            f"{match.group(2)}"
+        )
 
-    month = int(match.group(1))
-    day = int(match.group(2))
-
-    try:
-        return datetime(
-            reference_year,
-            month,
-            day,
-        ).date()
-
-    except ValueError:
-        return None
+    return None
 
 
-def parse_showtimes(html):
+def normalize_date(value, default_date):
     """
-    从猫眼影院网页中提取《奥德赛》的排片。
+    尝试从 API 返回值中解析日期。
 
-    注意：
-    如果页面结构发生变化导致完全解析不到数据，
-    这里会抛异常，而不是返回空列表。
+    如果 API 没有返回日期，
+    就使用本次请求的目标日期。
     """
 
-    container = extract_movie_section(html)
+    if value is None:
+        return default_date
 
-    text = container.get_text(
-        "\n",
-        strip=True,
-    )
+    text = str(value).strip()
 
-    # 检查页面是否真的包含排片相关字段
-    required_words = [
-        "放映时间",
-        "语言版本",
-        "放映厅",
+    patterns = [
+        r"(\d{4})-(\d{1,2})-(\d{1,2})",
+        r"(\d{4})/(\d{1,2})/(\d{1,2})",
+        r"(\d{1,2})月(\d{1,2})日",
     ]
 
-    for word in required_words:
-        if word not in text:
-            raise RuntimeError(
-                f"Movie section does not contain "
-                f"expected field: {word}"
-            )
+    for pattern in patterns:
 
-    # -------------------------------------------------
-    # 猫眼网页通常会把每个日期对应的排片表
-    # 放在相邻的结构中。
-    #
-    # 这里先从所有 table 中提取《奥德赛》的
-    # 时间 / 语言 / 影厅。
-    # -------------------------------------------------
+        match = re.search(
+            pattern,
+            text,
+        )
 
-    tables = container.find_all("table")
+        if not match:
+            continue
 
-    print(
-        f"Found {len(tables)} schedule tables "
-        f"in movie section."
+        try:
+
+            if len(match.groups()) == 3:
+
+                if len(match.group(1)) == 4:
+                    year = int(match.group(1))
+                    month = int(match.group(2))
+                    day = int(match.group(3))
+
+                else:
+                    year = default_date.year
+                    month = int(match.group(1))
+                    day = int(match.group(2))
+
+                return datetime(
+                    year,
+                    month,
+                    day,
+                ).date()
+
+        except ValueError:
+            pass
+
+    return default_date
+
+
+def parse_showtime_object(
+    show,
+    request_date,
+):
+    """
+    将一个 API 场次对象转换成我们的统一格式。
+    """
+
+    time_value = get_value(
+        show,
+        [
+            "showTime",
+            "showtime",
+            "show_time",
+            "startTime",
+            "start_time",
+            "beginTime",
+            "begin_time",
+        ],
     )
+
+    show_time = normalize_time(
+        time_value
+    )
+
+    if not show_time:
+        return None
+
+    date_value = get_value(
+        show,
+        [
+            "showDate",
+            "show_date",
+            "date",
+            "showDay",
+            "show_day",
+        ],
+    )
+
+    show_date = normalize_date(
+        date_value,
+        request_date,
+    )
+
+    hall = get_value(
+        show,
+        [
+            "hallName",
+            "hall_name",
+            "hall",
+            "roomName",
+            "room_name",
+        ],
+    )
+
+    if hall is None:
+        hall = ""
+
+    hall = str(hall).strip()
+
+    language = get_value(
+        show,
+        [
+            "language",
+            "languageName",
+            "language_name",
+            "lang",
+            "version",
+            "versionName",
+            "version_name",
+        ],
+    )
+
+    if language is None:
+        language = ""
+
+    language = str(language).strip()
+
+    # 有些猫眼接口会把版本放在 showVersion
+    if not language:
+
+        version = get_value(
+            show,
+            [
+                "showVersion",
+                "show_version",
+            ],
+        )
+
+        if version is not None:
+            language = str(
+                version
+            ).strip()
+
+    key = "|".join(
+        [
+            show_date.isoformat(),
+            show_time,
+            hall,
+            language,
+        ]
+    )
+
+    return {
+        "key": key,
+        "date": show_date.isoformat(),
+        "time": show_time,
+        "hall": hall,
+        "language": language,
+    }
+
+
+def parse_api_showtimes(
+    data,
+    request_date,
+):
+    """
+    从猫眼 API JSON 中寻找场次。
+
+    不依赖单一固定 JSON 路径。
+    """
+
+    movie_objects = find_target_movie_objects(
+        data
+    )
+
+    if not movie_objects:
+        print("----------------------------------------")
+        print(
+            "Target movie was NOT found in API response."
+        )
+
+        print(
+            "Top-level JSON keys:"
+        )
+
+        print(
+            list(data.keys())
+        )
+
+        raise RuntimeError(
+            f"Movie '{MOVIE_NAME}' "
+            f"(movieId={MOVIE_ID}) "
+            "was not found in Maoyan API response."
+        )
 
     results = []
 
-    today = datetime.now().date()
-    end_date = today + timedelta(
-        days=MONITOR_DAYS - 1
-    )
+    for movie in movie_objects:
 
-    current_date = None
-
-    # 先从 container 的文本节点中寻找日期
-    # 并尝试关联后续表格。
-    elements = list(
-        container.find_all(
-            ["div", "ul", "li", "table"]
-        )
-    )
-
-    for element in elements:
-        element_text = element.get_text(
-            " ",
-            strip=True,
+        show_objects = (
+            recursive_find_showtime_objects(
+                movie
+            )
         )
 
-        parsed_date = parse_date_from_text(
-            element_text,
-            today.year,
+        print(
+            f"Potential showtime objects "
+            f"in movie object: "
+            f"{len(show_objects)}"
         )
 
-        if parsed_date:
-            if today <= parsed_date <= end_date:
-                current_date = parsed_date
+        for show in show_objects:
 
-        # 表格才尝试解析场次
-        if element.name != "table":
-            continue
-
-        if current_date is None:
-            continue
-
-        rows = element.find_all("tr")
-
-        for row in rows:
-            cells = [
-                c.get_text(
-                    " ",
-                    strip=True,
-                )
-                for c in row.find_all(
-                    ["td", "th"]
-                )
-            ]
-
-            if not cells:
-                continue
-
-            row_text = " ".join(cells)
-
-            # 找时间，例如 09:45 / 22:45
-            time_match = re.search(
-                r"\b([01]\d|2[0-3]):[0-5]\d\b",
-                row_text,
+            parsed = parse_showtime_object(
+                show,
+                request_date,
             )
 
-            if not time_match:
-                continue
+            if parsed:
+                results.append(parsed)
 
-            show_time = time_match.group(0)
-
-            # 尝试找语言版本
-            language = ""
-
-            language_candidates = [
-                "英语IMAX2D",
-                "英语IMAX3D",
-                "英语2D",
-                "英语3D",
-                "国语2D",
-                "国语3D",
-                "粤语2D",
-                "粤语3D",
-            ]
-
-            for candidate in language_candidates:
-                if candidate in row_text:
-                    language = candidate
-                    break
-
-            # 尝试找影厅
-            hall = ""
-
-            hall_match = re.search(
-                r"([^\s|]+厅)",
-                row_text,
-            )
-
-            if hall_match:
-                hall = hall_match.group(1)
-
-            if not hall:
-                continue
-
-            key = "|".join(
-                [
-                    current_date.isoformat(),
-                    show_time,
-                    hall,
-                    language,
-                ]
-            )
-
-            results.append(
-                {
-                    "key": key,
-                    "date": current_date.isoformat(),
-                    "time": show_time,
-                    "hall": hall,
-                    "language": language,
-                }
-            )
-
-    # 去重
     unique = {}
 
     for item in results:
         unique[item["key"]] = item
 
-    results = list(unique.values())
-
-    if not results:
-        raise RuntimeError(
-            "Maoyan page contains the movie and schedule "
-            "headers, but no actual showtimes could be parsed. "
-            "The page structure may have changed."
-        )
+    results = list(
+        unique.values()
+    )
 
     return sorted(
         results,
@@ -385,8 +590,138 @@ def parse_showtimes(html):
     )
 
 
+def fetch_showtimes_for_date(
+    target_date
+):
+    """
+    查询指定日期的《奥德赛》排片。
+    """
+
+    params = {
+        "movieId": MOVIE_ID,
+        "cinemaId": CINEMA_ID,
+        "date": target_date.isoformat(),
+    }
+
+    data = request_maoyan(
+        params
+    )
+
+    results = parse_api_showtimes(
+        data,
+        target_date,
+    )
+
+    return results
+
+
+def fetch_all_showtimes():
+    """
+    查询未来 MONITOR_DAYS 天。
+
+    逐日请求，避免 API 一次只返回当天数据。
+    """
+
+    today = datetime.now().date()
+
+    end_date = (
+        today
+        + timedelta(
+            days=MONITOR_DAYS - 1
+        )
+    )
+
+    all_results = []
+
+    print("========================================")
+    print("MAOYAN API MONITOR")
+    print("========================================")
+    print(
+        f"Cinema: {CINEMA_NAME}"
+    )
+    print(
+        f"Cinema ID: {CINEMA_ID}"
+    )
+    print(
+        f"Movie: {MOVIE_NAME}"
+    )
+    print(
+        f"Movie ID: {MOVIE_ID}"
+    )
+    print(
+        f"Date range: "
+        f"{today} -> {end_date}"
+    )
+
+    for i in range(
+        MONITOR_DAYS
+    ):
+
+        target_date = (
+            today
+            + timedelta(days=i)
+        )
+
+        print()
+        print(
+            "========================================"
+        )
+        print(
+            f"Checking date: "
+            f"{target_date}"
+        )
+        print(
+            "========================================"
+        )
+
+        try:
+
+            results = fetch_showtimes_for_date(
+                target_date
+            )
+
+            print(
+                f"Parsed "
+                f"{len(results)} "
+                f"showtimes for "
+                f"{target_date}"
+            )
+
+            all_results.extend(
+                results
+            )
+
+        except Exception as e:
+
+            print(
+                f"WARNING: Failed to fetch "
+                f"{target_date}: {e}"
+            )
+
+            # 第一天失败时不要静默当成没有排片。
+            # 直接抛错，方便判断猫眼接口是否风控。
+            if i == 0:
+                raise
+
+    unique = {}
+
+    for item in all_results:
+        unique[item["key"]] = item
+
+    return sorted(
+        unique.values(),
+        key=lambda x: (
+            x["date"],
+            x["time"],
+            x["hall"],
+        ),
+    )
+
+
 def get_bark_key():
-    bark_key = os.environ.get("BARK_KEY")
+    bark_key = os.environ.get(
+        "BARK_KEY"
+    )
 
     if not bark_key:
         raise RuntimeError(
@@ -399,7 +734,9 @@ def get_bark_key():
 def send_bark(new_showtimes):
     bark_key = get_bark_key()
 
-    title = f"🎬《{MOVIE_NAME}》新增场次"
+    title = (
+        f"🎬《{MOVIE_NAME}》新增场次"
+    )
 
     lines = [
         f"影院：{CINEMA_NAME}",
@@ -413,16 +750,32 @@ def send_bark(new_showtimes):
             x["time"],
         ),
     ):
+
+        language = (
+            show["language"]
+            or "版本未知"
+        )
+
+        hall = (
+            show["hall"]
+            or "影厅未知"
+        )
+
         lines.append(
             f"{show['date']}  "
             f"{show['time']}  "
-            f"{show['language']}  "
-            f"{show['hall']}"
+            f"{language}  "
+            f"{hall}"
         )
 
-    body = "\n".join(lines)
+    body = "\n".join(
+        lines
+    )
 
-    url = f"https://api.day.app/{bark_key}"
+    url = (
+        f"https://api.day.app/"
+        f"{bark_key}"
+    )
 
     response = requests.get(
         url,
@@ -443,14 +796,18 @@ def send_bark(new_showtimes):
     )
 
     print(
-        f"Bark response: {response.text}"
+        f"Bark response: "
+        f"{response.text}"
     )
 
 
 def send_bark_test():
     bark_key = get_bark_key()
 
-    url = f"https://api.day.app/{bark_key}"
+    url = (
+        f"https://api.day.app/"
+        f"{bark_key}"
+    )
 
     response = requests.get(
         url,
@@ -474,33 +831,54 @@ def send_bark_test():
     )
 
     print(
-        f"Bark response: {response.text}"
+        f"Bark response: "
+        f"{response.text}"
     )
 
 
 def main():
+
     test_bark = (
-        os.environ.get("TEST_BARK", "").lower()
+        os.environ.get(
+            "TEST_BARK",
+            ""
+        ).lower()
         == "true"
     )
 
     if test_bark:
-        print("========================================")
-        print("BARK TEST MODE")
-        print("========================================")
+
+        print(
+            "========================================"
+        )
+        print(
+            "BARK TEST MODE"
+        )
+        print(
+            "========================================"
+        )
 
         send_bark_test()
 
         return
 
-    print("========================================")
-    print("NORMAL MONITOR MODE")
-    print("========================================")
+    print(
+        "========================================"
+    )
+    print(
+        "NORMAL MONITOR MODE"
+    )
+    print(
+        "========================================"
+    )
 
     old_state = load_state()
 
     old_keys = set(
-        old_state.get("showtimes", [])
+        old_state.get(
+            "showtimes",
+            []
+        )
     )
 
     print(
@@ -508,30 +886,41 @@ def main():
         f"{len(old_keys)}"
     )
 
-    # ---------------------------------------------
-    # 抓猫眼网页
-    # ---------------------------------------------
+    # -----------------------------------------
+    # 使用猫眼 API 获取排片
+    # -----------------------------------------
 
-    html = fetch_page()
-
-    current = parse_showtimes(html)
+    current = fetch_all_showtimes()
 
     current_keys = {
         x["key"]
         for x in current
     }
 
-    print("----------------------------------------")
     print(
-        f"Successfully parsed "
-        f"{len(current_keys)} showtimes."
+        "----------------------------------------"
     )
 
-    # 输出未来10天的统计
+    print(
+        f"Successfully parsed "
+        f"{len(current_keys)} "
+        f"showtimes."
+    )
+
+    # -----------------------------------------
+    # 输出未来10天统计
+    # -----------------------------------------
+
     today = datetime.now().date()
 
-    for i in range(MONITOR_DAYS):
-        date = today + timedelta(days=i)
+    for i in range(
+        MONITOR_DAYS
+    ):
+
+        date = (
+            today
+            + timedelta(days=i)
+        )
 
         date_str = date.isoformat()
 
@@ -546,27 +935,37 @@ def main():
             f"{count} showtimes"
         )
 
-    # ---------------------------------------------
+    # -----------------------------------------
     # 第一次成功抓到真实数据
-    # ---------------------------------------------
+    # -----------------------------------------
 
-    if not old_state.get("showtimes"):
-        save_state(current_keys)
+    if not old_state.get(
+        "showtimes"
+    ):
+
+        save_state(
+            current_keys
+        )
 
         print(
             "Initial baseline created "
-            "from successfully parsed Maoyan data."
+            "from successfully parsed "
+            "Maoyan API data."
         )
 
         return
 
-    # ---------------------------------------------
+    # -----------------------------------------
     # 找新增场次
-    # ---------------------------------------------
+    # -----------------------------------------
 
-    new_keys = current_keys - old_keys
+    new_keys = (
+        current_keys
+        - old_keys
+    )
 
     if new_keys:
+
         new_showtimes = [
             x
             for x in current
@@ -579,6 +978,7 @@ def main():
         )
 
         for show in new_showtimes:
+
             print(
                 f"NEW: "
                 f"{show['date']} "
@@ -587,12 +987,19 @@ def main():
                 f"{show['hall']}"
             )
 
-        send_bark(new_showtimes)
+        send_bark(
+            new_showtimes
+        )
 
     else:
-        print("No new showtimes.")
 
-    save_state(current_keys)
+        print(
+            "No new showtimes."
+        )
+
+    save_state(
+        current_keys
+    )
 
     print(
         "State saved successfully."
@@ -600,9 +1007,13 @@ def main():
 
 
 if __name__ == "__main__":
+
     try:
+
         main()
+
     except Exception as e:
+
         print(
             f"ERROR: {e}"
         )
