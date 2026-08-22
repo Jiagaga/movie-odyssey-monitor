@@ -263,17 +263,29 @@ def find_target_movie_objects(data):
 
 def recursive_find_showtime_objects(obj):
     """
-    从电影对象中递归寻找可能的场次对象。
+    猫眼 cinemaDetail 的真实排片结构：
+
+    movie
+      └── shows[]
+            └── plist[]
+                  ├── tm    放映时间
+                  ├── dt    日期
+                  ├── th    影厅
+                  ├── lang  语言
+                  └── tp    版本/类型
+
+    因此这里支持猫眼使用的短字段。
     """
 
     found = []
 
     if isinstance(obj, dict):
 
-        # 常见场次字段
+        # 猫眼当前 cinemaDetail API 的场次字段
         has_time = any(
             key in obj
             for key in (
+                "tm",
                 "showTime",
                 "showtime",
                 "show_time",
@@ -316,7 +328,9 @@ def get_value(obj, keys):
 
 def normalize_time(value):
     """
-    把各种可能的时间格式统一成 HH:MM。
+    猫眼 tm 通常就是：
+    10:30
+    19:45
     """
 
     if value is None:
@@ -324,11 +338,6 @@ def normalize_time(value):
 
     text = str(value).strip()
 
-    # 例如：
-    # 10:30
-    # 10:30:00
-    # 2026-08-22 10:30:00
-    # 2026-08-22T10:30:00
     match = re.search(
         r"\b([01]\d|2[0-3]):([0-5]\d)"
         r"(?::[0-5]\d)?\b",
@@ -346,10 +355,11 @@ def normalize_time(value):
 
 def normalize_date(value, default_date):
     """
-    尝试从 API 返回值中解析日期。
-
-    如果 API 没有返回日期，
-    就使用本次请求的目标日期。
+    猫眼 dt 可能是：
+    2026-08-22
+    08-22
+    8月22日
+    等形式。
     """
 
     if value is None:
@@ -360,6 +370,7 @@ def normalize_date(value, default_date):
     patterns = [
         r"(\d{4})-(\d{1,2})-(\d{1,2})",
         r"(\d{4})/(\d{1,2})/(\d{1,2})",
+        r"(\d{1,2})-(\d{1,2})",
         r"(\d{1,2})月(\d{1,2})日",
     ]
 
@@ -375,23 +386,25 @@ def normalize_date(value, default_date):
 
         try:
 
-            if len(match.groups()) == 3:
+            groups = match.groups()
 
-                if len(match.group(1)) == 4:
-                    year = int(match.group(1))
-                    month = int(match.group(2))
-                    day = int(match.group(3))
+            if len(groups) == 3:
 
-                else:
-                    year = default_date.year
-                    month = int(match.group(1))
-                    day = int(match.group(2))
+                year = int(groups[0])
+                month = int(groups[1])
+                day = int(groups[2])
 
-                return datetime(
-                    year,
-                    month,
-                    day,
-                ).date()
+            else:
+
+                year = default_date.year
+                month = int(groups[0])
+                day = int(groups[1])
+
+            return datetime(
+                year,
+                month,
+                day,
+            ).date()
 
         except ValueError:
             pass
@@ -404,12 +417,20 @@ def parse_showtime_object(
     request_date,
 ):
     """
-    将一个 API 场次对象转换成我们的统一格式。
+    解析猫眼 plist 中的一条场次。
+
+    猫眼字段：
+        tm   = 时间
+        dt   = 日期
+        th   = 影厅
+        lang = 语言
+        tp   = 版本/类型
     """
 
     time_value = get_value(
         show,
         [
+            "tm",
             "showTime",
             "showtime",
             "show_time",
@@ -430,6 +451,7 @@ def parse_showtime_object(
     date_value = get_value(
         show,
         [
+            "dt",
             "showDate",
             "show_date",
             "date",
@@ -446,6 +468,7 @@ def parse_showtime_object(
     hall = get_value(
         show,
         [
+            "th",
             "hallName",
             "hall_name",
             "hall",
@@ -462,13 +485,10 @@ def parse_showtime_object(
     language = get_value(
         show,
         [
+            "lang",
             "language",
             "languageName",
             "language_name",
-            "lang",
-            "version",
-            "versionName",
-            "version_name",
         ],
     )
 
@@ -477,21 +497,28 @@ def parse_showtime_object(
 
     language = str(language).strip()
 
-    # 有些猫眼接口会把版本放在 showVersion
-    if not language:
+    version = get_value(
+        show,
+        [
+            "tp",
+            "showVersion",
+            "show_version",
+            "version",
+            "versionName",
+            "version_name",
+        ],
+    )
 
-        version = get_value(
-            show,
-            [
-                "showVersion",
-                "show_version",
-            ],
-        )
+    if version is not None:
+        version = str(version).strip()
 
-        if version is not None:
-            language = str(
-                version
-            ).strip()
+        if version and version not in language:
+            if language:
+                language = (
+                    f"{language}{version}"
+                )
+            else:
+                language = version
 
     key = "|".join(
         [
@@ -516,9 +543,8 @@ def parse_api_showtimes(
     request_date,
 ):
     """
-    从猫眼 API JSON 中寻找场次。
-
-    不依赖单一固定 JSON 路径。
+    从猫眼 cinemaDetail JSON 中解析
+    目标电影的 plist 排片。
     """
 
     movie_objects = find_target_movie_objects(
@@ -526,18 +552,6 @@ def parse_api_showtimes(
     )
 
     if not movie_objects:
-        print("----------------------------------------")
-        print(
-            "Target movie was NOT found in API response."
-        )
-
-        print(
-            "Top-level JSON keys:"
-        )
-
-        print(
-            list(data.keys())
-        )
 
         raise RuntimeError(
             f"Movie '{MOVIE_NAME}' "
@@ -549,27 +563,51 @@ def parse_api_showtimes(
 
     for movie in movie_objects:
 
-        show_objects = (
-            recursive_find_showtime_objects(
-                movie
-            )
+        # 猫眼真实结构：
+        #
+        # movie
+        #   └── shows
+        #         └── plist
+        #
+        shows = movie.get(
+            "shows",
+            []
         )
 
         print(
-            f"Potential showtime objects "
-            f"in movie object: "
-            f"{len(show_objects)}"
+            f"Movie has "
+            f"{len(shows)} show groups."
         )
 
-        for show in show_objects:
+        for show_group in shows:
 
-            parsed = parse_showtime_object(
-                show,
-                request_date,
+            plist = show_group.get(
+                "plist",
+                []
             )
 
-            if parsed:
-                results.append(parsed)
+            print(
+                f"  plist entries: "
+                f"{len(plist)}"
+            )
+
+            for show in plist:
+
+                if not isinstance(
+                    show,
+                    dict,
+                ):
+                    continue
+
+                parsed = parse_showtime_object(
+                    show,
+                    request_date,
+                )
+
+                if parsed:
+                    results.append(
+                        parsed
+                    )
 
     unique = {}
 
@@ -594,7 +632,11 @@ def fetch_showtimes_for_date(
     target_date
 ):
     """
-    查询指定日期的《奥德赛》排片。
+    当前猫眼 cinemaDetail 实际上会返回
+    影院/电影的完整排片结构。
+
+    因此 date 参数继续传入，但解析时
+    以返回数据中的 dt 为准。
     """
 
     params = {
