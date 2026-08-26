@@ -2,6 +2,7 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -540,7 +541,12 @@ def main():
                 f"{show['hall']}"
             )
 
+        # 第一次立即推送；2 分钟后用完全相同的内容再推送一次。
         send_bark(new_showtimes)
+        print("Waiting 2 minutes before the duplicate Bark notification...")
+        time.sleep(120)
+        send_bark(new_showtimes)
+        print("Duplicate Bark notification sent successfully.")
 
     else:
         print("No new showtimes for target date.")
