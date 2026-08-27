@@ -1,7 +1,6 @@
 import json
 import os
 import re
-import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -16,9 +15,13 @@ CINEMA_NAME = "MOViE MOViE 前滩太古里"
 MOVIE_NAME = "奥德赛"
 
 # ==============================
-# 只需要修改这一行，就可以换监控日期
+# 监控日期：可以同时设置多个目标日期
 # ==============================
-TARGET_DATE = "2026-08-31"
+TARGET_DATES = [
+    "2026-09-02",
+    "2026-09-03",
+    "2026-09-04",
+]
 
 STATE_FILE = Path("state.json")
 
@@ -49,11 +52,10 @@ def load_state():
         return {}
 
 
-def save_state(target_date, showtimes):
+def save_state(target_states):
     data = {
         "updated_at": datetime.now().isoformat(),
-        "target_date": target_date,
-        "showtimes": sorted(showtimes),
+        "target_dates": target_states,
     }
 
     STATE_FILE.write_text(
@@ -399,14 +401,14 @@ def get_bark_key():
     return bark_key
 
 
-def send_bark(new_showtimes):
+def send_bark(target_date, new_showtimes):
     bark_key = get_bark_key()
 
-    title = f"🎬《{MOVIE_NAME}》{TARGET_DATE} 新增场次"
+    title = f"🎬《{MOVIE_NAME}》{target_date} 新增场次"
 
     lines = [
         f"影院：{CINEMA_NAME}",
-        f"日期：{TARGET_DATE}",
+        f"日期：{target_date}",
         "",
     ]
 
@@ -479,88 +481,102 @@ def main():
         return
 
     print("========================================")
-    print("TARGET-DATE MONITOR MODE")
+    print("MULTI TARGET-DATE MONITOR MODE")
     print("========================================")
     print(f"Cinema: {CINEMA_NAME}")
     print(f"Movie: {MOVIE_NAME}")
-    print(f"Target date: {TARGET_DATE}")
+    print(f"Target dates: {', '.join(TARGET_DATES)}")
 
     old_state = load_state()
+    old_target_states = old_state.get("target_dates", {})
 
-    # 如果用户修改了 TARGET_DATE，则自动把新日期视为全新的监控任务。
-    if old_state.get("target_date") != TARGET_DATE:
-        old_keys = set()
-        print("Target date changed. Starting a fresh baseline for this date.")
-    else:
-        old_keys = set(old_state.get("showtimes", []))
+    # 兼容旧版单日期 state.json：旧状态不会错误地套用到新日期。
+    if not isinstance(old_target_states, dict):
+        old_target_states = {}
 
-    print(f"Previously known showtimes for target date: {len(old_keys)}")
+    target_states = {}
 
-    current = fetch_showtimes_for_date(TARGET_DATE)
+    for target_date in TARGET_DATES:
+        print("\n========================================")
+        print(f"Checking target date: {target_date}")
+        print("========================================")
 
-    # API 返回的数据可能包含其他日期；这里严格只保留目标日期。
-    current = [
-        show for show in current
-        if show["date"] == TARGET_DATE
-    ]
+        old_keys = set(old_target_states.get(target_date, []))
 
-    current_keys = {show["key"] for show in current}
+        if target_date not in old_target_states:
+            print("New target date. Starting a fresh baseline for this date.")
 
-    print("----------------------------------------")
-    print(f"Target date {TARGET_DATE}: {len(current_keys)} showtimes")
+        print(f"Previously known showtimes for target date: {len(old_keys)}")
 
-    if current:
-        for show in current:
-            print(
-                f"CURRENT: {show['date']} "
-                f"{show['time']} "
-                f"{show['language']} "
-                f"{show['hall']}"
-            )
-    else:
-        print(f"No showtimes released yet for {TARGET_DATE}.")
+        current = fetch_showtimes_for_date(target_date)
 
-    # 只比较“这个目标日期”历史上见过的场次。
-    # 已经结束的场次不会因为下架而导致整体数量下降，从而干扰判断。
-    new_keys = current_keys - old_keys
-
-    if new_keys:
-        new_showtimes = [
+        # API 返回的数据可能包含其他日期；这里严格只保留当前目标日期。
+        current = [
             show for show in current
-            if show["key"] in new_keys
+            if show["date"] == target_date
         ]
 
+        current_keys = {show["key"] for show in current}
+
         print("----------------------------------------")
-        print(f"NEW SHOWTIMES FOUND: {len(new_showtimes)}")
+        print(f"Target date {target_date}: {len(current_keys)} showtimes")
 
-        for show in new_showtimes:
-            print(
-                f"NEW: {show['date']} "
-                f"{show['time']} "
-                f"{show['language']} "
-                f"{show['hall']}"
-            )
+        if current:
+            for show in current:
+                print(
+                    f"CURRENT: {show['date']} "
+                    f"{show['time']} "
+                    f"{show['language']} "
+                    f"{show['hall']}"
+                )
+        else:
+            print(f"No showtimes released yet for {target_date}.")
 
-        # 第一次立即推送；2 分钟后用完全相同的内容再推送一次。
-        send_bark(new_showtimes)
-        print("Waiting 2 minutes before the duplicate Bark notification...")
-        time.sleep(120)
-        send_bark(new_showtimes)
-        print("Duplicate Bark notification sent successfully.")
+        # 只比较这个目标日期历史上见过的场次。
+        # 已结束/下架的场次不会因为数量下降而干扰判断。
+        new_keys = current_keys - old_keys
 
-    else:
-        print("No new showtimes for target date.")
+        if new_keys:
+            new_showtimes = [
+                show for show in current
+                if show["key"] in new_keys
+            ]
 
-    # 保存“历史上见过”的场次，而不是只保存当前场次。
-    # 这样场次短暂下架后重新出现，也不会重复骚扰。
-    seen_keys = old_keys | current_keys
+            print("----------------------------------------")
+            print(f"NEW SHOWTIMES FOUND: {len(new_showtimes)}")
 
-    save_state(TARGET_DATE, seen_keys)
+            for show in new_showtimes:
+                print(
+                    f"NEW: {show['date']} "
+                    f"{show['time']} "
+                    f"{show['language']} "
+                    f"{show['hall']}"
+                )
 
-    print(
-        f"State saved successfully. "
-        f"Known target-date showtimes: {len(seen_keys)}"
-    )
+            # 第一次立即推送；2 分钟后用完全相同的内容再推送一次。
+            send_bark(target_date, new_showtimes)
+            print("Waiting 2 minutes before the duplicate Bark notification...")
+            time.sleep(120)
+            send_bark(target_date, new_showtimes)
+            print("Duplicate Bark notification sent successfully.")
+
+        else:
+            print("No new showtimes for target date.")
+
+        # 保存“历史上见过”的场次，而不是只保存当前场次。
+        # 这样场次下架后重新出现，也不会重复骚扰。
+        seen_keys = old_keys | current_keys
+        target_states[target_date] = sorted(seen_keys)
+
+        print(
+            f"Known target-date showtimes after update: {len(seen_keys)}"
+        )
+
+    save_state(target_states)
+
+    print("\n========================================")
+    print("State saved successfully for all target dates.")
+    print("========================================")
 
 
 if __name__ == "__main__":
@@ -568,4 +584,4 @@ if __name__ == "__main__":
         main()
     except Exception as e:
         print(f"ERROR: {e}")
-        sys.exit(1)
+        raise
