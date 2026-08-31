@@ -1,9 +1,10 @@
 name: Monitor The Odyssey
 
 on:
-  schedule:
-    # Every 5 minutes, offset by 2 minutes to avoid the top-of-hour load spike.
-    - cron: "2-59/5 * * * *"
+  # Monitoring completed — scheduled polling paused after tickets were purchased.
+  # To resume monitoring in the future, restore the schedule below.
+  # schedule:
+  #   - cron: "2-59/5 * * * *"
 
   workflow_dispatch:
     inputs:
